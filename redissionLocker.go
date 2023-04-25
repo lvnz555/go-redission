@@ -1,0 +1,215 @@
+package redission
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/go-redis/redis"
+	uuid "github.com/google/uuid"
+)
+
+var lockScript string = strings.Join([]string{
+	"if (redis.call('exists', KEYS[1]) == 0) then ",
+	"redis.call('hset', KEYS[1], ARGV[2], 1); ",
+	"redis.call('pexpire', KEYS[1], ARGV[1]); ",
+	"return nil; ",
+	"end; ",
+	"if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then ",
+	"redis.call('hincrby', KEYS[1], ARGV[2], 1); ",
+	"redis.call('pexpire', KEYS[1], ARGV[1]); ",
+	"return nil; ",
+	"end; ",
+	"return redis.call('pttl', KEYS[1]);",
+}, "")
+
+var refreshLockScript string = strings.Join([]string{
+	"if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then ",
+	"redis.call('pexpire', KEYS[1], ARGV[1]); ",
+	"return 1; ",
+	"end; ",
+	"return 0;",
+}, "")
+
+var unlockScript string = strings.Join([]string{
+	"if (redis.call('exists', KEYS[1]) == 0) then ",
+	"redis.call('publish', KEYS[2], ARGV[1]); ",
+	"return 1; ",
+	"end;",
+	"if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then ",
+	"return nil;",
+	"end; ",
+	"local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); ",
+	"if (counter > 0) then ",
+	"redis.call('pexpire', KEYS[1], ARGV[2]); ",
+	"return 0; ",
+	"else ",
+	"redis.call('del', KEYS[1]); ",
+	"redis.call('publish', KEYS[2], ARGV[1]); ",
+	"return 1; ",
+	"end; ",
+	"return nil;",
+}, "")
+
+const internalLockLeaseTime = uint64(30 * time.Second)
+const unlockMessage = 0
+
+type RedissionLockConfig struct {
+	LockLeaseTime time.Duration
+	Prefix        string
+	ChanPrefix    string
+	Key           string
+}
+
+type redissionLocker struct {
+	token         string
+	key           string
+	chankey       string
+	exit          chan struct{}
+	lockLeaseTime uint64
+	client        *redis.Client
+}
+
+func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
+	ttl, err := rl.tryLock(rl.key)
+	if err != nil {
+		panic(err)
+	}
+
+	if ttl <= 0 {
+		go rl.refreshLockTimeout(ctx, rl.key)
+		return
+	}
+
+	sub := rl.client.Subscribe(rl.chankey)
+	defer sub.Close()
+	timer := time.NewTimer(ttl)
+	defer timer.Stop()
+	var outimer *time.Timer
+	if len(timeout) > 0 && timeout[0] > 0 {
+		outimer = time.NewTimer(timeout[0])
+	}
+LOOP:
+	for {
+		ttl, err = rl.tryLock(rl.key)
+		if err != nil {
+			panic(err)
+		}
+
+		if ttl <= 0 {
+			go rl.refreshLockTimeout(ctx, rl.key)
+			return
+		}
+
+		if outimer != nil {
+			select {
+			case <-sub.ChannelSize(1):
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(ttl)
+			case <-ctx.Done():
+				// break LOOP
+				panic("lock context already release")
+			case <-timer.C:
+				timer.Reset(ttl)
+			case <-outimer.C:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				break LOOP
+			}
+		} else {
+			select {
+			case <-sub.ChannelSize(1):
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(ttl)
+			case <-ctx.Done():
+				// break LOOP
+				panic("lock context already release")
+			case <-timer.C:
+				timer.Reset(ttl)
+			}
+		}
+	}
+}
+
+func (rl *redissionLocker) refreshLockTimeout(ctx context.Context, key string) {
+	timer := time.NewTimer(time.Duration(rl.lockLeaseTime / 3))
+	defer timer.Stop()
+LOOP:
+	for {
+		select {
+		case <-timer.C:
+			timer.Reset(time.Duration(rl.lockLeaseTime / 3))
+			// update key expire time
+			res := rl.client.Eval(refreshLockScript, []string{key}, rl.lockLeaseTime, rl.token)
+			val, err := res.Int()
+			if err != nil {
+				panic(err)
+			}
+			if val == 0 {
+				return
+			}
+		case <-rl.exit:
+			break LOOP
+		case <-ctx.Done():
+			break LOOP
+		}
+	}
+}
+
+func (rl *redissionLocker) cancelRefreshLockTime() {
+	close(rl.exit)
+}
+
+func (rl *redissionLocker) tryLock(key string) (time.Duration, error) {
+	res := rl.client.Eval(lockScript, []string{key}, rl.lockLeaseTime, rl.token)
+	v, err := res.Result()
+	if err != redis.Nil && err != nil {
+		return 0, err
+	}
+
+	if v == nil {
+		return 0, nil
+	}
+
+	return time.Duration(v.(int64)), nil
+}
+
+func (rl *redissionLocker) UnLock() {
+	res := rl.client.Eval(unlockScript, []string{rl.key, rl.chankey}, unlockMessage, rl.lockLeaseTime, rl.token)
+	val, err := res.Result()
+	if err != redis.Nil && err != nil {
+		panic(err)
+	}
+	if val == nil {
+		panic("attempt to unlock lock, not locked by current routine by lock id:" + rl.token)
+	}
+	if val.(int64) == 1 {
+		rl.cancelRefreshLockTime()
+	}
+}
+
+func NewLocker(client *redis.Client, ops *RedissionLockConfig) *redissionLocker {
+	r := &redissionLocker{
+		token:  uuid.New().String(),
+		client: client,
+		exit:   make(chan struct{}),
+	}
+
+	if len(ops.Prefix) <= 0 {
+		ops.Prefix = "redission-lock"
+	}
+	if len(ops.ChanPrefix) <= 0 {
+		ops.ChanPrefix = "redission-lock-channel"
+	}
+	if ops.LockLeaseTime == 0 {
+		r.lockLeaseTime = internalLockLeaseTime
+	}
+	r.key = strings.Join([]string{ops.Prefix, ops.Key}, ":")
+	r.chankey = strings.Join([]string{ops.ChanPrefix, ops.Key}, ":")
+	return r
+}
