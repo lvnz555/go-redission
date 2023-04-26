@@ -18,7 +18,6 @@ func init() {
 
 func SetLogger(logger *log.Logger) {
 	internal.Logger = logger
-	internal.LogLevel = internal.DEBUG
 }
 
 var lockScript string = strings.Join([]string{
