@@ -15,19 +15,19 @@ import (
 )
 
 func main() {
-	rdb := redis.NewClient(&redis.Options{
-		Network:     "tcp",
-		Addr:        "127.0.0.1:6379",
-		PoolSize:    50,
-		DialTimeout: 10 * time.Second,
-	})
+  rdb := redis.NewClient(&redis.Options{
+	Network:     "tcp",
+	Addr:        "127.0.0.1:6379",
+	PoolSize:    50,
+	DialTimeout: 10 * time.Second,
+  })
 
-	locker := redission.GetLocker(rdb, &redission.RedissionLockConfig{
-		Key: "pro:001",
-	})
-	
-	locker.Lock(c.Request.Context())
-    // ---
-    locker.UnLock()
+  locker := redission.GetLocker(rdb, &redission.RedissionLockConfig{
+	Key: "pro:001",
+  })
+
+  locker.Lock(context.Background())
+  // ---
+  locker.UnLock()
 }
 ```
