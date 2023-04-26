@@ -160,19 +160,35 @@ func (rl *redissionLocker) subscribeLock(sub *redis.PubSub, out chan struct{}) {
 	if sub == nil || out == nil {
 		return
 	}
+	internal.Debugf("lock:%s enter sub routine\n", rl.token)
+LOOP:
 	for {
-		_, err := sub.ReceiveMessage()
+		msg, err := sub.Receive()
 		if err != nil {
 			internal.Infof("sub receive message %v\n", err)
-			break
-		}
-		if len(out) > 0 {
-			// if channel hava msg. drop it
-			internal.Debugf("drop message when channel if full\n")
-			continue
+			break LOOP
 		}
 
-		out <- struct{}{}
+		select {
+		case <-rl.exit:
+			break LOOP
+		default:
+			if len(out) > 0 {
+				// if channel hava msg. drop it
+				internal.Debugf("drop message when channel if full\n")
+				continue
+			}
+
+			switch msg.(type) {
+			case *redis.Subscription:
+				// Ignore.
+			case *redis.Pong:
+				// Ignore.
+			case *redis.Message:
+				out <- struct{}{}
+			default:
+			}
+		}
 	}
 	internal.Debugf("lock:%s sub routine release\n", rl.token)
 }
