@@ -19,28 +19,28 @@ var Logger *log.Logger
 var LogLevel = NOLOG
 
 func Infof(s string, args ...interface{}) {
-	if Logger == nil || LogLevel <= INFO {
+	if Logger == nil || LogLevel > INFO {
 		return
 	}
 	Logger.Output(2, fmt.Sprintf(s, args...))
 }
 
 func Debugf(s string, args ...interface{}) {
-	if Logger == nil || LogLevel <= DEBUG {
+	if Logger == nil || LogLevel > DEBUG {
 		return
 	}
 	Logger.Output(2, fmt.Sprintf(s, args...))
 }
 
 func Warnf(s string, args ...interface{}) {
-	if Logger == nil || LogLevel <= WARN {
+	if Logger == nil || LogLevel > WARN {
 		return
 	}
 	Logger.Output(2, fmt.Sprintf(s, args...))
 }
 
 func Errorf(s string, args ...interface{}) {
-	if Logger == nil || LogLevel <= ERROR {
+	if Logger == nil || LogLevel > ERROR {
 		return
 	}
 	Logger.Output(2, fmt.Sprintf(s, args...))
