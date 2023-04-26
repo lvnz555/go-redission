@@ -21,7 +21,7 @@ func init() {
 }
 
 func TestRedissionLocker(t *testing.T) {
-	locker := NewLocker(rdb, &RedissionLockConfig{
+	locker := GetLocker(rdb, &RedissionLockConfig{
 		Key: "test",
 	})
 
@@ -38,7 +38,7 @@ func BenchmarkXxx(b *testing.B) {
 	for i := 0; i < 1000; i++ {
 		wg.Add(1)
 		go func(wg *sync.WaitGroup, ii int) {
-			locker := NewLocker(rdb, &RedissionLockConfig{
+			locker := GetLocker(rdb, &RedissionLockConfig{
 				Key: "test",
 			})
 

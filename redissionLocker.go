@@ -2,12 +2,24 @@ package redission
 
 import (
 	"context"
+	"log"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/go-redis/redis"
 	uuid "github.com/google/uuid"
+	"github.com/lvnz555/go-redission/internal"
 )
+
+func init() {
+	SetLogger(log.New(os.Stderr, "go-redision: ", log.LstdFlags|log.Lshortfile))
+}
+
+func SetLogger(logger *log.Logger) {
+	internal.Logger = logger
+	internal.LogLevel = internal.DEBUG
+}
 
 var lockScript string = strings.Join([]string{
 	"if (redis.call('exists', KEYS[1]) == 0) then ",
@@ -81,8 +93,12 @@ func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
 		return
 	}
 
+	submsg := make(chan struct{}, 1)
+	defer close(submsg)
 	sub := rl.client.Subscribe(rl.chankey)
 	defer sub.Close()
+	go rl.subscribeLock(sub, submsg)
+
 	timer := time.NewTimer(ttl)
 	defer timer.Stop()
 	var outimer *time.Timer
@@ -100,10 +116,9 @@ LOOP:
 			go rl.refreshLockTimeout(ctx, rl.key)
 			return
 		}
-
 		if outimer != nil {
 			select {
-			case <-sub.ChannelSize(1):
+			case <-submsg:
 				if !timer.Stop() {
 					<-timer.C
 				}
@@ -121,7 +136,7 @@ LOOP:
 			}
 		} else {
 			select {
-			case <-sub.ChannelSize(1):
+			case <-submsg:
 				if !timer.Stop() {
 					<-timer.C
 				}
@@ -136,14 +151,40 @@ LOOP:
 	}
 }
 
+func (rl *redissionLocker) subscribeLock(sub *redis.PubSub, out chan struct{}) {
+	defer func() {
+		if err := recover(); err != nil {
+			internal.Errorf("subscribeLock catch err: %v\n", err)
+		}
+	}()
+	if sub == nil || out == nil {
+		return
+	}
+	for {
+		_, err := sub.ReceiveMessage()
+		if err != nil {
+			internal.Infof("sub receive message %v\n", err)
+			return
+		}
+		if len(out) > 0 {
+			// if channel hava msg. drop it
+			internal.Debugf("drop message when channel if full")
+			continue
+		}
+
+		out <- struct{}{}
+	}
+}
+
 func (rl *redissionLocker) refreshLockTimeout(ctx context.Context, key string) {
-	timer := time.NewTimer(time.Duration(rl.lockLeaseTime / 3))
+	lockTime := time.Duration(rl.lockLeaseTime / 3)
+	timer := time.NewTimer(lockTime)
 	defer timer.Stop()
 LOOP:
 	for {
 		select {
 		case <-timer.C:
-			timer.Reset(time.Duration(rl.lockLeaseTime / 3))
+			timer.Reset(lockTime)
 			// update key expire time
 			res := rl.client.Eval(refreshLockScript, []string{key}, rl.lockLeaseTime, rl.token)
 			val, err := res.Int()
@@ -151,6 +192,7 @@ LOOP:
 				panic(err)
 			}
 			if val == 0 {
+				internal.Debugf("not find the lock key of self")
 				return
 			}
 		case <-rl.exit:
@@ -193,7 +235,7 @@ func (rl *redissionLocker) UnLock() {
 	}
 }
 
-func NewLocker(client *redis.Client, ops *RedissionLockConfig) *redissionLocker {
+func GetLocker(client *redis.Client, ops *RedissionLockConfig) *redissionLocker {
 	r := &redissionLocker{
 		token:  uuid.New().String(),
 		client: client,
