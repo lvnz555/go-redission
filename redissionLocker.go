@@ -164,19 +164,21 @@ func (rl *redissionLocker) subscribeLock(sub *redis.PubSub, out chan struct{}) {
 		_, err := sub.ReceiveMessage()
 		if err != nil {
 			internal.Infof("sub receive message %v\n", err)
-			return
+			break
 		}
 		if len(out) > 0 {
 			// if channel hava msg. drop it
-			internal.Debugf("drop message when channel if full")
+			internal.Debugf("drop message when channel if full\n")
 			continue
 		}
 
 		out <- struct{}{}
 	}
+	internal.Debugf("lock:%s sub routine release\n", rl.token)
 }
 
 func (rl *redissionLocker) refreshLockTimeout(ctx context.Context, key string) {
+	internal.Debugf("lock: %s lock %s\n", rl.token, key)
 	lockTime := time.Duration(rl.lockLeaseTime / 3)
 	timer := time.NewTimer(lockTime)
 	defer timer.Stop()
@@ -192,8 +194,8 @@ LOOP:
 				panic(err)
 			}
 			if val == 0 {
-				internal.Debugf("not find the lock key of self")
-				return
+				internal.Debugf("not find the lock key of self\n")
+				break LOOP
 			}
 		case <-rl.exit:
 			break LOOP
@@ -201,6 +203,7 @@ LOOP:
 			break LOOP
 		}
 	}
+	internal.Debugf("lock: %s refresh routine release\n", rl.token)
 }
 
 func (rl *redissionLocker) cancelRefreshLockTime() {
@@ -230,6 +233,7 @@ func (rl *redissionLocker) UnLock() {
 	if val == nil {
 		panic("attempt to unlock lock, not locked by current routine by lock id:" + rl.token)
 	}
+	internal.Debugf("lock: %s unlock %s\n", rl.token, rl.key)
 	if val.(int64) == 1 {
 		rl.cancelRefreshLockTime()
 	}
