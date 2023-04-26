@@ -23,8 +23,9 @@ func main() {
 	})
 
 	locker := redission.GetLocker(rdb, &redission.RedissionLockConfig{
-			Key: "pro:001",
-		})
+		Key: "pro:001",
+	})
+	
 	locker.Lock(c.Request.Context())
     // ---
     locker.UnLock()
