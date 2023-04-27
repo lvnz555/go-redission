@@ -10,6 +10,7 @@ import (
 	"github.com/go-redis/redis"
 	uuid "github.com/google/uuid"
 	"github.com/lvnz555/go-redission/internal"
+	"github.com/lvnz555/go-redission/listen"
 )
 
 func init() {
@@ -79,6 +80,7 @@ type redissionLocker struct {
 	exit          chan struct{}
 	lockLeaseTime uint64
 	client        *redis.Client
+	listenManager *listen.ListenManager
 }
 
 func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
@@ -92,11 +94,13 @@ func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
 		return
 	}
 
-	submsg := make(chan struct{}, 1)
-	defer close(submsg)
-	sub := rl.client.Subscribe(rl.chankey)
-	defer sub.Close()
-	go rl.subscribeLock(sub, submsg)
+	// submsg := make(chan struct{}, 1)
+	// defer close(submsg)
+	// sub := rl.client.Subscribe(rl.chankey)
+	// defer sub.Close()
+	// go rl.subscribeLock(sub, submsg)
+	listen := rl.listenManager.Subscribe(rl.key, rl.token)
+	defer rl.listenManager.UnSubscribe(rl.key, rl.token)
 
 	timer := time.NewTimer(ttl)
 	defer timer.Stop()
@@ -117,10 +121,15 @@ LOOP:
 		}
 		if outimer != nil {
 			select {
-			case <-submsg:
+			case _, ok := <-listen.C:
 				if !timer.Stop() {
 					<-timer.C
 				}
+
+				if !ok {
+					panic("lock listen release")
+				}
+
 				timer.Reset(ttl)
 			case <-ctx.Done():
 				// break LOOP
@@ -135,10 +144,15 @@ LOOP:
 			}
 		} else {
 			select {
-			case <-submsg:
+			case _, ok := <-listen.C:
 				if !timer.Stop() {
 					<-timer.C
 				}
+
+				if !ok {
+					panic("lock listen release")
+				}
+
 				timer.Reset(ttl)
 			case <-ctx.Done():
 				// break LOOP
@@ -256,9 +270,10 @@ func (rl *redissionLocker) UnLock() {
 
 func GetLocker(client *redis.Client, ops *RedissionLockConfig) *redissionLocker {
 	r := &redissionLocker{
-		token:  uuid.New().String(),
-		client: client,
-		exit:   make(chan struct{}),
+		token:         uuid.New().String(),
+		client:        client,
+		exit:          make(chan struct{}),
+		listenManager: listen.GetListerManager(client),
 	}
 
 	if len(ops.Prefix) <= 0 {
