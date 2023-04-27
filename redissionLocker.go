@@ -94,13 +94,13 @@ func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
 		return
 	}
 
-	// submsg := make(chan struct{}, 1)
-	// defer close(submsg)
-	// sub := rl.client.Subscribe(rl.chankey)
-	// defer sub.Close()
-	// go rl.subscribeLock(sub, submsg)
-	listen := rl.listenManager.Subscribe(rl.key, rl.token)
-	defer rl.listenManager.UnSubscribe(rl.key, rl.token)
+	submsg := make(chan struct{}, 1)
+	defer close(submsg)
+	sub := rl.client.Subscribe(rl.chankey)
+	defer sub.Close()
+	go rl.subscribeLock(sub, submsg)
+	// listen := rl.listenManager.Subscribe(rl.key, rl.token)
+	// defer rl.listenManager.UnSubscribe(rl.key, rl.token)
 
 	timer := time.NewTimer(ttl)
 	defer timer.Stop()
@@ -121,7 +121,7 @@ LOOP:
 		}
 		if outimer != nil {
 			select {
-			case _, ok := <-listen.C:
+			case _, ok := <-submsg:
 				if !timer.Stop() {
 					<-timer.C
 				}
@@ -144,7 +144,7 @@ LOOP:
 			}
 		} else {
 			select {
-			case _, ok := <-listen.C:
+			case _, ok := <-submsg:
 				if !timer.Stop() {
 					<-timer.C
 				}
