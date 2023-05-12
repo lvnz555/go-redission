@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis"
@@ -81,26 +82,32 @@ type redissionLocker struct {
 	lockLeaseTime uint64
 	client        *redis.Client
 	listenManager *listen.ListenManager
+	once          *sync.Once
 }
 
 func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
+	if rl.exit == nil {
+		rl.exit = make(chan struct{})
+	}
 	ttl, err := rl.tryLock(rl.key)
 	if err != nil {
 		panic(err)
 	}
 
 	if ttl <= 0 {
-		go rl.refreshLockTimeout(ctx, rl.key)
+		rl.once.Do(func() {
+			go rl.refreshLockTimeout(ctx, rl.key)
+		})
 		return
 	}
 
-	// submsg := make(chan struct{}, 1)
-	// defer close(submsg)
-	// sub := rl.client.Subscribe(rl.chankey)
-	// defer sub.Close()
-	// go rl.subscribeLock(sub, submsg)
-	listen := rl.listenManager.Subscribe(rl.key, rl.token)
-	defer rl.listenManager.UnSubscribe(rl.key, rl.token)
+	submsg := make(chan struct{}, 1)
+	defer close(submsg)
+	sub := rl.client.Subscribe(rl.chankey)
+	defer sub.Close()
+	go rl.subscribeLock(sub, submsg)
+	// listen := rl.listenManager.Subscribe(rl.key, rl.token)
+	// defer rl.listenManager.UnSubscribe(rl.key, rl.token)
 
 	timer := time.NewTimer(ttl)
 	defer timer.Stop()
@@ -116,12 +123,14 @@ LOOP:
 		}
 
 		if ttl <= 0 {
-			go rl.refreshLockTimeout(ctx, rl.key)
+			rl.once.Do(func() {
+				go rl.refreshLockTimeout(ctx, rl.key)
+			})
 			return
 		}
 		if outimer != nil {
 			select {
-			case _, ok := <-listen.C:
+			case _, ok := <-submsg:
 				if !timer.Stop() {
 					<-timer.C
 				}
@@ -144,7 +153,7 @@ LOOP:
 			}
 		} else {
 			select {
-			case _, ok := <-listen.C:
+			case _, ok := <-submsg:
 				if !timer.Stop() {
 					<-timer.C
 				}
@@ -237,6 +246,8 @@ LOOP:
 
 func (rl *redissionLocker) cancelRefreshLockTime() {
 	close(rl.exit)
+	rl.exit = nil
+	rl.once = &sync.Once{}
 }
 
 func (rl *redissionLocker) tryLock(key string) (time.Duration, error) {
@@ -274,6 +285,7 @@ func GetLocker(client *redis.Client, ops *RedissionLockConfig) *redissionLocker 
 		client:        client,
 		exit:          make(chan struct{}),
 		listenManager: listen.GetListerManager(client),
+		once:          &sync.Once{},
 	}
 
 	if len(ops.Prefix) <= 0 {
