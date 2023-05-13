@@ -64,7 +64,7 @@ var unlockScript string = strings.Join([]string{
 	"return nil;",
 }, "")
 
-const internalLockLeaseTime = uint64(30 * time.Second)
+const internalLockLeaseTime = uint64(30) * 1000
 const unlockMessage = 0
 
 type RedissionLockConfig struct {
@@ -89,14 +89,14 @@ func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
 	if rl.exit == nil {
 		rl.exit = make(chan struct{})
 	}
-	ttl, err := rl.tryLock(rl.key)
+	ttl, err := rl.tryLock()
 	if err != nil {
 		panic(err)
 	}
 
 	if ttl <= 0 {
 		rl.once.Do(func() {
-			go rl.refreshLockTimeout(ctx, rl.key)
+			go rl.refreshLockTimeout()
 		})
 		return
 	}
@@ -117,14 +117,14 @@ func (rl *redissionLocker) Lock(ctx context.Context, timeout ...time.Duration) {
 	}
 LOOP:
 	for {
-		ttl, err = rl.tryLock(rl.key)
+		ttl, err = rl.tryLock()
 		if err != nil {
 			panic(err)
 		}
 
 		if ttl <= 0 {
 			rl.once.Do(func() {
-				go rl.refreshLockTimeout(ctx, rl.key)
+				go rl.refreshLockTimeout()
 			})
 			return
 		}
@@ -215,9 +215,9 @@ LOOP:
 	internal.Debugf("lock:%s sub routine release\n", rl.token)
 }
 
-func (rl *redissionLocker) refreshLockTimeout(ctx context.Context, key string) {
-	internal.Debugf("lock: %s lock %s\n", rl.token, key)
-	lockTime := time.Duration(rl.lockLeaseTime / 3)
+func (rl *redissionLocker) refreshLockTimeout() {
+	internal.Debugf("lock: %s lock %s\n", rl.token, rl.key)
+	lockTime := time.Duration(rl.lockLeaseTime/3) * time.Millisecond
 	timer := time.NewTimer(lockTime)
 	defer timer.Stop()
 LOOP:
@@ -226,7 +226,7 @@ LOOP:
 		case <-timer.C:
 			timer.Reset(lockTime)
 			// update key expire time
-			res := rl.client.Eval(refreshLockScript, []string{key}, rl.lockLeaseTime, rl.token)
+			res := rl.client.Eval(refreshLockScript, []string{rl.key}, rl.lockLeaseTime, rl.token)
 			val, err := res.Int()
 			if err != nil {
 				panic(err)
@@ -237,21 +237,22 @@ LOOP:
 			}
 		case <-rl.exit:
 			break LOOP
-		case <-ctx.Done():
-			break LOOP
+
 		}
 	}
 	internal.Debugf("lock: %s refresh routine release\n", rl.token)
 }
 
 func (rl *redissionLocker) cancelRefreshLockTime() {
-	close(rl.exit)
-	rl.exit = nil
-	rl.once = &sync.Once{}
+	if rl.exit != nil {
+		close(rl.exit)
+		rl.exit = nil
+		rl.once = &sync.Once{}
+	}
 }
 
-func (rl *redissionLocker) tryLock(key string) (time.Duration, error) {
-	res := rl.client.Eval(lockScript, []string{key}, rl.lockLeaseTime, rl.token)
+func (rl *redissionLocker) tryLock() (time.Duration, error) {
+	res := rl.client.Eval(lockScript, []string{rl.key}, rl.lockLeaseTime, rl.token)
 	v, err := res.Result()
 	if err != redis.Nil && err != nil {
 		return 0, err

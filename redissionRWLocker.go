@@ -127,23 +127,23 @@ var wunlockScript string = strings.Join([]string{
 	"return nil;",
 }, "")
 
-type redissionRWLocker struct {
+type redissionReadLocker struct {
 	redissionLocker
 	rwTimeoutTokenPrefix string
 }
 
-func (rl *redissionRWLocker) RLock(ctx context.Context, timeout ...time.Duration) {
+func (rl *redissionReadLocker) Lock(ctx context.Context, timeout ...time.Duration) {
 	if rl.exit == nil {
 		rl.exit = make(chan struct{})
 	}
-	ttl, err := rl.tryRLock(rl.key)
+	ttl, err := rl.tryLock()
 	if err != nil {
 		panic(err)
 	}
 
 	if ttl <= 0 {
 		rl.once.Do(func() {
-			go rl.refreshLockTimeout(ctx, rl.key)
+			go rl.refreshLockTimeout()
 		})
 		return
 	}
@@ -164,14 +164,14 @@ func (rl *redissionRWLocker) RLock(ctx context.Context, timeout ...time.Duration
 	}
 LOOP:
 	for {
-		ttl, err = rl.tryLock(rl.key)
+		ttl, err = rl.tryLock()
 		if err != nil {
 			panic(err)
 		}
 
 		if ttl <= 0 {
 			rl.once.Do(func() {
-				go rl.refreshLockTimeout(ctx, rl.key)
+				go rl.refreshLockTimeout()
 			})
 			return
 		}
@@ -220,97 +220,9 @@ LOOP:
 	}
 }
 
-func (rl *redissionRWLocker) Lock(ctx context.Context, timeout ...time.Duration) {
-	if rl.exit == nil {
-		rl.exit = make(chan struct{})
-	}
-	ttl, err := rl.tryLock(rl.key)
-	if err != nil {
-		panic(err)
-	}
-
-	if ttl <= 0 {
-		rl.once.Do(func() {
-			go rl.refreshLockTimeout(ctx, rl.key)
-		})
-		return
-	}
-
-	submsg := make(chan struct{}, 1)
-	defer close(submsg)
-	sub := rl.client.Subscribe(rl.chankey)
-	defer sub.Close()
-	go rl.subscribeLock(sub, submsg)
-	// listen := rl.listenManager.Subscribe(rl.key, rl.token)
-	// defer rl.listenManager.UnSubscribe(rl.key, rl.token)
-
-	timer := time.NewTimer(ttl)
-	defer timer.Stop()
-	var outimer *time.Timer
-	if len(timeout) > 0 && timeout[0] > 0 {
-		outimer = time.NewTimer(timeout[0])
-	}
-LOOP:
-	for {
-		ttl, err = rl.tryLock(rl.key)
-		if err != nil {
-			panic(err)
-		}
-
-		if ttl <= 0 {
-			rl.once.Do(func() {
-				go rl.refreshLockTimeout(ctx, rl.key)
-			})
-			return
-		}
-		if outimer != nil {
-			select {
-			case _, ok := <-submsg:
-				if !timer.Stop() {
-					<-timer.C
-				}
-
-				if !ok {
-					panic("lock listen release")
-				}
-
-				timer.Reset(ttl)
-			case <-ctx.Done():
-				// break LOOP
-				panic("lock context already release")
-			case <-timer.C:
-				timer.Reset(ttl)
-			case <-outimer.C:
-				if !timer.Stop() {
-					<-timer.C
-				}
-				break LOOP
-			}
-		} else {
-			select {
-			case _, ok := <-submsg:
-				if !timer.Stop() {
-					<-timer.C
-				}
-
-				if !ok {
-					panic("lock listen release")
-				}
-
-				timer.Reset(ttl)
-			case <-ctx.Done():
-				// break LOOP
-				panic("lock context already release")
-			case <-timer.C:
-				timer.Reset(ttl)
-			}
-		}
-	}
-}
-
-func (rl *redissionRWLocker) tryRLock(key string) (time.Duration, error) {
+func (rl *redissionReadLocker) tryLock() (time.Duration, error) {
 	writeLockToken := strings.Join([]string{rl.token, "write"}, ":")
-	res := rl.client.Eval(rlockScript, []string{key, rl.rwTimeoutTokenPrefix}, rl.lockLeaseTime, rl.token, writeLockToken)
+	res := rl.client.Eval(rlockScript, []string{rl.key, rl.rwTimeoutTokenPrefix}, rl.lockLeaseTime, rl.token, writeLockToken)
 	v, err := res.Result()
 	if err != redis.Nil && err != nil {
 		return 0, err
@@ -323,21 +235,7 @@ func (rl *redissionRWLocker) tryRLock(key string) (time.Duration, error) {
 	return time.Duration(v.(int64)), nil
 }
 
-func (rl *redissionRWLocker) tryLock(key string) (time.Duration, error) {
-	res := rl.client.Eval(wlockScript, []string{key}, rl.lockLeaseTime, rl.token)
-	v, err := res.Result()
-	if err != redis.Nil && err != nil {
-		return 0, err
-	}
-
-	if v == nil {
-		return 0, nil
-	}
-
-	return time.Duration(v.(int64)), nil
-}
-
-func (rl *redissionRWLocker) RUnLock() {
+func (rl *redissionReadLocker) UnLock() {
 	res := rl.client.Eval(runlockScript, []string{rl.key, rl.chankey, rl.rwTimeoutTokenPrefix, "{" + rl.key + "}"}, unlockMessage, rl.token)
 	val, err := res.Result()
 	if err != redis.Nil && err != nil {
@@ -352,7 +250,113 @@ func (rl *redissionRWLocker) RUnLock() {
 	}
 }
 
-func (rl *redissionRWLocker) UnLock() {
+type redissionWriteLocker struct {
+	redissionLocker
+}
+
+func (rl *redissionWriteLocker) Lock(ctx context.Context, timeout ...time.Duration) {
+	if rl.exit == nil {
+		rl.exit = make(chan struct{})
+	}
+	ttl, err := rl.tryLock()
+	if err != nil {
+		panic(err)
+	}
+
+	if ttl <= 0 {
+		rl.once.Do(func() {
+			go rl.refreshLockTimeout()
+		})
+		return
+	}
+
+	submsg := make(chan struct{}, 1)
+	defer close(submsg)
+	sub := rl.client.Subscribe(rl.chankey)
+	defer sub.Close()
+	go rl.subscribeLock(sub, submsg)
+	// listen := rl.listenManager.Subscribe(rl.key, rl.token)
+	// defer rl.listenManager.UnSubscribe(rl.key, rl.token)
+
+	timer := time.NewTimer(ttl)
+	defer timer.Stop()
+	var outimer *time.Timer
+	if len(timeout) > 0 && timeout[0] > 0 {
+		outimer = time.NewTimer(timeout[0])
+	}
+LOOP:
+	for {
+		ttl, err = rl.tryLock()
+		if err != nil {
+			panic(err)
+		}
+
+		if ttl <= 0 {
+			rl.once.Do(func() {
+				go rl.refreshLockTimeout()
+			})
+			return
+		}
+		if outimer != nil {
+			select {
+			case _, ok := <-submsg:
+				if !timer.Stop() {
+					<-timer.C
+				}
+
+				if !ok {
+					panic("lock listen release")
+				}
+
+				timer.Reset(ttl)
+			case <-ctx.Done():
+				// break LOOP
+				panic("lock context already release")
+			case <-timer.C:
+				timer.Reset(ttl)
+			case <-outimer.C:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				break LOOP
+			}
+		} else {
+			select {
+			case _, ok := <-submsg:
+				if !timer.Stop() {
+					<-timer.C
+				}
+
+				if !ok {
+					panic("lock listen release")
+				}
+
+				timer.Reset(ttl)
+			case <-ctx.Done():
+				// break LOOP
+				panic("lock context already release")
+			case <-timer.C:
+				timer.Reset(ttl)
+			}
+		}
+	}
+}
+
+func (rl *redissionWriteLocker) tryLock() (time.Duration, error) {
+	res := rl.client.Eval(wlockScript, []string{rl.key}, rl.lockLeaseTime, rl.token)
+	v, err := res.Result()
+	if err != redis.Nil && err != nil {
+		return 0, err
+	}
+
+	if v == nil {
+		return 0, nil
+	}
+
+	return time.Duration(v.(int64)), nil
+}
+
+func (rl *redissionWriteLocker) UnLock() {
 	res := rl.client.Eval(wunlockScript, []string{rl.key, rl.chankey}, unlockMessage, rl.lockLeaseTime, rl.token)
 	val, err := res.Result()
 	if err != redis.Nil && err != nil {
@@ -367,7 +371,7 @@ func (rl *redissionRWLocker) UnLock() {
 	}
 }
 
-func GetRWLocker(client *redis.Client, ops *RedissionLockConfig) *redissionRWLocker {
+func GetReadLocker(client *redis.Client, ops *RedissionLockConfig) *redissionReadLocker {
 	r := &redissionLocker{
 		token:         uuid.New().String(),
 		client:        client,
@@ -388,5 +392,28 @@ func GetRWLocker(client *redis.Client, ops *RedissionLockConfig) *redissionRWLoc
 	r.key = strings.Join([]string{ops.Prefix, ops.Key}, ":")
 	r.chankey = strings.Join([]string{ops.ChanPrefix, ops.Key}, ":")
 	tkey := "{" + r.key + "}"
-	return &redissionRWLocker{redissionLocker: *r, rwTimeoutTokenPrefix: strings.Join([]string{tkey, r.token, "rwlock_timeout"}, ":")}
+	return &redissionReadLocker{redissionLocker: *r, rwTimeoutTokenPrefix: strings.Join([]string{tkey, r.token, "rwlock_timeout"}, ":")}
+}
+
+func GetWriteLocker(client *redis.Client, ops *RedissionLockConfig) *redissionWriteLocker {
+	r := &redissionLocker{
+		token:         uuid.New().String(),
+		client:        client,
+		exit:          make(chan struct{}),
+		listenManager: listen.GetListerManager(client),
+		once:          &sync.Once{},
+	}
+
+	if len(ops.Prefix) <= 0 {
+		ops.Prefix = "redission-rwlock"
+	}
+	if len(ops.ChanPrefix) <= 0 {
+		ops.ChanPrefix = "redission-rwlock-channel"
+	}
+	if ops.LockLeaseTime == 0 {
+		r.lockLeaseTime = internalLockLeaseTime
+	}
+	r.key = strings.Join([]string{ops.Prefix, ops.Key}, ":")
+	r.chankey = strings.Join([]string{ops.ChanPrefix, ops.Key}, ":")
+	return &redissionWriteLocker{redissionLocker: *r}
 }
