@@ -11,7 +11,6 @@ import (
 	"github.com/go-redis/redis"
 	uuid "github.com/google/uuid"
 	"github.com/lvnz555/go-redission/internal"
-	"github.com/lvnz555/go-redission/listen"
 )
 
 func init() {
@@ -81,7 +80,6 @@ type redissionLocker struct {
 	exit          chan struct{}
 	lockLeaseTime uint64
 	client        *redis.Client
-	listenManager *listen.ListenManager
 	once          *sync.Once
 }
 
@@ -282,11 +280,10 @@ func (rl *redissionLocker) UnLock() {
 
 func GetLocker(client *redis.Client, ops *RedissionLockConfig) *redissionLocker {
 	r := &redissionLocker{
-		token:         uuid.New().String(),
-		client:        client,
-		exit:          make(chan struct{}),
-		listenManager: listen.GetListerManager(client),
-		once:          &sync.Once{},
+		token:  uuid.New().String(),
+		client: client,
+		exit:   make(chan struct{}),
+		once:   &sync.Once{},
 	}
 
 	if len(ops.Prefix) <= 0 {

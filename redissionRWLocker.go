@@ -9,7 +9,6 @@ import (
 	"github.com/go-redis/redis"
 	uuid "github.com/google/uuid"
 	"github.com/lvnz555/go-redission/internal"
-	"github.com/lvnz555/go-redission/listen"
 )
 
 var rlockScript string = strings.Join([]string{
@@ -373,11 +372,10 @@ func (rl *redissionWriteLocker) UnLock() {
 
 func GetReadLocker(client *redis.Client, ops *RedissionLockConfig) *redissionReadLocker {
 	r := &redissionLocker{
-		token:         uuid.New().String(),
-		client:        client,
-		exit:          make(chan struct{}),
-		listenManager: listen.GetListerManager(client),
-		once:          &sync.Once{},
+		token:  uuid.New().String(),
+		client: client,
+		exit:   make(chan struct{}),
+		once:   &sync.Once{},
 	}
 
 	if len(ops.Prefix) <= 0 {
@@ -397,11 +395,10 @@ func GetReadLocker(client *redis.Client, ops *RedissionLockConfig) *redissionRea
 
 func GetWriteLocker(client *redis.Client, ops *RedissionLockConfig) *redissionWriteLocker {
 	r := &redissionLocker{
-		token:         uuid.New().String(),
-		client:        client,
-		exit:          make(chan struct{}),
-		listenManager: listen.GetListerManager(client),
-		once:          &sync.Once{},
+		token:  uuid.New().String(),
+		client: client,
+		exit:   make(chan struct{}),
+		once:   &sync.Once{},
 	}
 
 	if len(ops.Prefix) <= 0 {
