@@ -26,7 +26,8 @@ var rlockScript string = strings.Join([]string{
 	"local key = KEYS[2] .. ':' .. ind;",
 	"redis.call('set', key, 1); ",
 	"redis.call('pexpire', key, ARGV[1]); ",
-	"redis.call('pexpire', KEYS[1], ARGV[1]); ",
+	"local remainTime = redis.call('pttl', KEYS[1]); ",
+	"redis.call('pexpire', KEYS[1], math.max(remainTime, ARGV[1])); ",
 	"return nil; ",
 	"end;",
 	"return redis.call('pttl', KEYS[1]);",
@@ -48,6 +49,7 @@ var runlockScript string = strings.Join([]string{
 	"redis.call('hdel', KEYS[1], ARGV[2]); ",
 	"end;",
 	"redis.call('del', KEYS[3] .. ':' .. (counter+1)); ",
+
 	"if (redis.call('hlen', KEYS[1]) > 1) then ",
 	"local maxRemainTime = -3; ",
 	"local keys = redis.call('hkeys', KEYS[1]); ",
@@ -74,6 +76,28 @@ var runlockScript string = strings.Join([]string{
 	"redis.call('del', KEYS[1]); ",
 	"redis.call('publish', KEYS[2], ARGV[1]); ",
 	"return 1; ",
+}, "")
+
+var rlockrefreshScript = strings.Join([]string{
+	"local counter = redis.call('hget', KEYS[1], ARGV[2]); ",
+	"if (counter ~= false) then ",
+	"redis.call('pexpire', KEYS[1], ARGV[1]); ",
+
+	"if (redis.call('hlen', KEYS[1]) > 1) then ",
+	"local keys = redis.call('hkeys', KEYS[1]); ",
+	"for n, key in ipairs(keys) do ",
+	"counter = tonumber(redis.call('hget', KEYS[1], key)); ",
+	"if type(counter) == 'number' then ",
+	"for i=counter, 1, -1 do ",
+	"redis.call('pexpire', KEYS[2] .. ':' .. key .. ':rwlock_timeout:' .. i, ARGV[1]); ",
+	"end; ",
+	"end; ",
+	"end; ",
+	"end; ",
+
+	"return 1; ",
+	"end; ",
+	"return 0;",
 }, "")
 
 var wlockScript string = strings.Join([]string{
@@ -129,6 +153,7 @@ var wunlockScript string = strings.Join([]string{
 type redissionReadLocker struct {
 	redissionLocker
 	rwTimeoutTokenPrefix string
+	prefixKey            string
 }
 
 func (rl *redissionReadLocker) Lock(ctx context.Context, timeout ...time.Duration) {
@@ -234,8 +259,36 @@ func (rl *redissionReadLocker) tryLock() (time.Duration, error) {
 	return time.Duration(v.(int64)), nil
 }
 
+func (rl *redissionReadLocker) refreshLockTimeout() {
+	internal.Debugf("rlock: %s lock %s\n", rl.token, rl.key)
+	lockTime := time.Duration(rl.lockLeaseTime/3) * time.Millisecond
+	timer := time.NewTimer(lockTime)
+	defer timer.Stop()
+LOOP:
+	for {
+		select {
+		case <-timer.C:
+			timer.Reset(lockTime)
+			// update key expire time
+			res := rl.client.Eval(rlockrefreshScript, []string{rl.key, rl.prefixKey}, rl.lockLeaseTime, rl.token)
+			val, err := res.Int()
+			if err != nil {
+				panic(err)
+			}
+			if val == 0 {
+				internal.Debugf("not find the rlock key of self\n")
+				break LOOP
+			}
+		case <-rl.exit:
+			break LOOP
+
+		}
+	}
+	internal.Debugf("rlock: %s refresh routine release\n", rl.token)
+}
+
 func (rl *redissionReadLocker) UnLock() {
-	res := rl.client.Eval(runlockScript, []string{rl.key, rl.chankey, rl.rwTimeoutTokenPrefix, "{" + rl.key + "}"}, unlockMessage, rl.token)
+	res := rl.client.Eval(runlockScript, []string{rl.key, rl.chankey, rl.rwTimeoutTokenPrefix, rl.prefixKey}, unlockMessage, rl.token)
 	val, err := res.Result()
 	if err != redis.Nil && err != nil {
 		panic(err)
@@ -389,8 +442,8 @@ func GetReadLocker(client *redis.Client, ops *RedissionLockConfig) *redissionRea
 	}
 	r.key = strings.Join([]string{ops.Prefix, ops.Key}, ":")
 	r.chankey = strings.Join([]string{ops.ChanPrefix, ops.Key}, ":")
-	tkey := "{" + r.key + "}"
-	return &redissionReadLocker{redissionLocker: *r, rwTimeoutTokenPrefix: strings.Join([]string{tkey, r.token, "rwlock_timeout"}, ":")}
+	tkey := strings.Join([]string{"{", r.key, "}"}, "")
+	return &redissionReadLocker{redissionLocker: *r, rwTimeoutTokenPrefix: strings.Join([]string{tkey, r.token, "rwlock_timeout"}, ":"), prefixKey: tkey}
 }
 
 func GetWriteLocker(client *redis.Client, ops *RedissionLockConfig) *redissionWriteLocker {
